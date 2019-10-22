@@ -1,6 +1,8 @@
 import os
+import argparse
 import torch
 import torch.utils.data as data
+import timeit
 
 from torchvision import transforms
 from data_loader import get_segmentation_dataset
@@ -15,7 +17,7 @@ class Evaluator(object):
     def __init__(self, args):
         self.args = args
         # output folder
-        self.outdir = 'test_result'
+        self.outdir = '%s_result'%args.split
         if not os.path.exists(self.outdir):
             os.makedirs(self.outdir)
         # image transform
@@ -24,8 +26,10 @@ class Evaluator(object):
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
         # dataset and dataloader
-        val_dataset = get_segmentation_dataset(args.dataset, split='val', mode='testval',
-                                               transform=input_transform)
+        # val_dataset = get_segmentation_dataset(args.dataset, split=args.split, mode='testval',
+        #                                        transform=input_transform)
+        val_dataset = get_segmentation_dataset(args.dataset, root='./datasets/'+args.dataset, split=args.split,
+                                               is_transform=True, img_size=768)                                       
         self.val_loader = data.DataLoader(dataset=val_dataset,
                                           batch_size=1,
                                           shuffle=False)
@@ -37,6 +41,11 @@ class Evaluator(object):
 
     def eval(self):
         self.model.eval()
+        mean_miou = 0.0
+        mean_pixelAcc = 0.0
+
+        start_time = timeit.default_timer()
+
         for i, (image, label) in enumerate(self.val_loader):
             image = image.to(self.args.device)
 
@@ -49,10 +58,17 @@ class Evaluator(object):
             self.metric.update(pred, label)
             pixAcc, mIoU = self.metric.get()
             print('Sample %d, validation pixAcc: %.3f%%, mIoU: %.3f%%' % (i + 1, pixAcc * 100, mIoU * 100))
+            mean_miou += mIoU
+            mean_pixelAcc += pixAcc
 
             predict = pred.squeeze(0)
             mask = get_color_pallete(predict, self.args.dataset)
             mask.save(os.path.join(self.outdir, 'seg_{}.png'.format(i)))
+
+        end_time = timeit.default_timer()
+
+        print('Time taken:%0.4f s'%(end_time-start_time))
+        print('Mean mIoU: %.4f%%, Mean PixelAcc: %.4f%%'%( mean_miou/len(self.val_loader), mean_pixelAcc/len(self.val_loader)))
 
 
 if __name__ == '__main__':

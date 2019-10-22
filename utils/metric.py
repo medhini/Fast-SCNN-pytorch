@@ -47,6 +47,7 @@ class SegmentationMetric(object):
         metrics : tuple of float
             pixAcc and mIoU
         """
+        print(self.total_correct, self.total_label)
         pixAcc = 1.0 * self.total_correct / (np.spacing(1) + self.total_label)
         IoU = 1.0 * self.total_inter / (np.spacing(1) + self.total_union)
         # It has same result with np.nanmean() when all class exist

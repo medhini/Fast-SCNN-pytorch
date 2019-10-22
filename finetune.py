@@ -6,6 +6,7 @@ import shutil
 import torch
 import torch.utils.data as data
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 
 from torchvision import transforms
 from data_loader import get_segmentation_dataset
@@ -66,6 +67,46 @@ def parse_args():
     print(args)
     return args
 
+def cross_entropy2d(input, target, weight=None, size_average=True):
+    n, c, h, w = input.size()
+    nt, ht, wt = target.size()
+
+    # Handle inconsistent size between input and target
+    if h != ht and w != wt:  # upsample labels
+        input = F.interpolate(input, size=(ht, wt), mode="bilinear", align_corners=True)
+
+    input = input.transpose(1, 2).transpose(2, 3).contiguous().view(-1, c)
+    target = target.view(-1)
+    loss = F.cross_entropy(
+        input, target, weight=weight, size_average=size_average, ignore_index=250
+    )
+    return loss
+
+
+def multi_scale_cross_entropy2d(
+    input, target, weight=None, size_average=True, scale_weight=None,
+    cls_weight=None
+):
+    if not isinstance(input, tuple):
+        return cross_entropy2d(
+            input=input, target=target, weight=weight, size_average=size_average
+        )
+
+    # Auxiliary training for PSPNet [1.0, 0.4] and ICNet [1.0, 0.4, 0.16]
+    if scale_weight is None:  # scale_weight: torch tensor type
+        n_inp = len(input)
+        scale = 0.4
+        scale_weight = torch.pow(scale * torch.ones(n_inp), torch.arange(n_inp).float()).to(
+            target.device
+        )
+
+    loss = 0.0
+    for i, inp in enumerate(input):
+        loss = loss + scale_weight[i] * cross_entropy2d(
+            input=inp, target=target, weight=weight, size_average=size_average
+        )
+
+    return loss
 
 class Trainer(object):
     def __init__(self, args):
@@ -76,9 +117,13 @@ class Trainer(object):
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
         # dataset and dataloader
-        data_kwargs = {'transform': input_transform, 'base_size': args.base_size, 'crop_size': args.crop_size}
-        train_dataset = get_segmentation_dataset(args.dataset, split=args.train_split, mode='train', **data_kwargs)
-        val_dataset = get_segmentation_dataset(args.dataset, split='val', mode='val', **data_kwargs)
+        # data_kwargs = {'transform': input_transform, 'base_size': args.base_size, 'crop_size': args.crop_size}
+        # train_dataset = get_segmentation_dataset(args.dataset, split=args.train_split, mode='train', **data_kwargs)
+        # val_dataset = get_segmentation_dataset(args.dataset, split='val', mode='val', **data_kwargs)
+        # Setup Dataloader
+        data_kwargs = { 'is_transform':True, 'img_size':args.crop_size}
+        train_dataset = get_segmentation_dataset(args.dataset,root='./datasets/'+args.dataset, split=args.train_split, **data_kwargs)
+        val_dataset = get_segmentation_dataset(args.dataset,root='./datasets/'+args.dataset, split='val', **data_kwargs)
         self.train_loader = data.DataLoader(dataset=train_dataset,
                                             batch_size=args.batch_size,
                                             shuffle=True,
@@ -87,6 +132,8 @@ class Trainer(object):
                                           batch_size=1,
                                           shuffle=False)
 
+        n_classes = train_dataset.n_classes
+    
         # create network
         self.model = get_fast_scnn(dataset=args.dataset, aux=args.aux)
         if torch.cuda.device_count() > 1:
@@ -102,16 +149,17 @@ class Trainer(object):
 
                 checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage)
                 # op surgery to change classes
-                heads = ["module.classification.weight", "module.classification.bias", \
-                    "module.aux_cls.weight", "module.aux_cls.bias"]
-                curr_state_dict = model.state_dict()
+                heads = ["classifier.conv.1.weight", "classifier.conv.1.bias"]
+                curr_state_dict = self.model.state_dict()
                 for param in heads:
-                    checkpoint["model_state"][param] = curr_state_dict[param]
+                    checkpoint[param] = curr_state_dict[param]
                 # end op surgery
                 self.model.load_state_dict(checkpoint)
+
         # create criterion
         self.criterion = MixSoftmaxCrossEntropyOHEMLoss(aux=args.aux, aux_weight=args.aux_weight,
                                                         ignore_index=-1).to(args.device)
+        # self.criterion = multi_scale_cross_entropy2d.to(args.device)
 
         # optimizer
         self.optimizer = torch.optim.SGD(self.model.parameters(),
@@ -128,6 +176,9 @@ class Trainer(object):
 
         self.best_pred = 0.0
 
+        # for name, param in self.model.state_dict().items():
+        #     print(name, param.shape)
+
     def train(self):
         cur_iters = 0
         start_time = time.time()
@@ -139,14 +190,16 @@ class Trainer(object):
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = cur_lr
 
+                if images.shape[0] == 1:
+                    continue
+
                 images = images.to(self.args.device)
                 targets = targets.to(self.args.device)
 
                 outputs = self.model(images)
-
-                print(len(outputs), outputs[0].shape, targets.shape, type(targets[0]))
-
-                loss = self.criterion(outputs, targets)
+                # print(len(outputs), outputs[0].shape, targets.shape, type(targets[0]))
+                # loss = self.criterion(outputs, targets)
+                loss = multi_scale_cross_entropy2d(outputs, targets)
 
                 self.optimizer.zero_grad()
                 loss.backward()
